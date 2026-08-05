@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the GeoDynamics paper."
+title: "GeoDynamics"
+type: software
+version: 0.1.0
+date-released: 2026-08-05
+authors:
+  - family-names: "Dan"
+    given-names: "Tingting"
+  - family-names: "Ding"
+    given-names: "Jiaqi"
+  - family-names: "Wu"
+    given-names: "Guorong"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Dan"
+      given-names: "Tingting"
+    - family-names: "Ding"
+      given-names: "Jiaqi"
+    - family-names: "Wu"
+      given-names: "Guorong"
+  title: "GeoDynamics: A Geometric State-Space Neural Network for Understanding Brain Dynamics on Riemannian Manifolds"
+  year: 2025
+  notes: "Add the final venue, authors, DOI, and archival URL before release."

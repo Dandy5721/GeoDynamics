@@ -1,253 +1,365 @@
-import math
-from typing import Optional
+"""GeoDynamics model and SPD-manifold operations."""
+
+from __future__ import annotations
 
 import torch
-import torch.nn as nn
-import torch.nn.init
-import torch.nn.functional as F
-from torch import Tensor
-from spd import *
-from einops import rearrange, repeat
-import torch.optim as optim
-def logdet_distance_squared(X: Tensor, Y: Tensor) -> Tensor:
+from torch import Tensor, nn
+
+__all__ = [
+    "GeoDynamics",
+    "SpatiallyPreservingAttention",
+    "StateSpaceDiscretization",
+    "frechet_mean_logdet",
+    "logdet_distance_squared",
+    "matrix_log_spd",
+    "project_spd",
+    "state_space_kernel",
+]
+
+
+def _sym(matrix: Tensor) -> Tensor:
+    return 0.5 * (matrix + matrix.transpose(-1, -2))
+
+
+def project_spd(matrix: Tensor, epsilon: float = 1e-5) -> Tensor:
+    """Symmetrize a matrix and add the diagonal regularizer from Sec. 2.2."""
+    matrix = torch.nan_to_num(_sym(matrix))
+    identity = torch.eye(
+        matrix.shape[-1], dtype=matrix.dtype, device=matrix.device
+    )
+    return matrix + epsilon * identity
+
+
+def matrix_log_spd(matrix: Tensor, epsilon: float = 1e-6) -> Tensor:
+    """Map an SPD matrix to the tangent space at identity (Eq. 11)."""
+    matrix = project_spd(matrix, epsilon)
+    offset = torch.linspace(
+        1.0, 2.0, matrix.shape[-1], dtype=matrix.dtype, device=matrix.device
+    )
+    matrix = matrix + epsilon * offset.diag()
+    values, vectors = torch.linalg.eigh(matrix)
+    log_values = values.clamp_min(epsilon).log().unsqueeze(-2)
+    return (vectors * log_values) @ vectors.transpose(-1, -2)
+
+
+def logdet_distance_squared(first: Tensor, second: Tensor) -> Tensor:
+    """Stein/Jensen-Bregman LogDet divergence from Eq. 2."""
+    first, second = project_spd(first), project_spd(second)
+    middle = 0.5 * (first + second)
+    return torch.linalg.slogdet(middle).logabsdet - 0.5 * (
+        torch.linalg.slogdet(first).logabsdet
+        + torch.linalg.slogdet(second).logabsdet
+    )
+
+
+def frechet_mean_logdet(
+    matrices: Tensor | list[Tensor],
+    weights: Tensor | list[float],
+    num_iterations: int = 5,
+    epsilon: float = 1e-5,
+) -> Tensor:
+    """Weighted Stein mean used by the state and observation updates."""
+    if isinstance(matrices, (list, tuple)):
+        matrices = torch.stack(list(matrices), dim=-3)
+    matrices = project_spd(matrices, epsilon)
+    weights = torch.as_tensor(
+        weights, dtype=matrices.dtype, device=matrices.device
+    )
+    if weights.shape[-1] != matrices.shape[-3]:
+        raise ValueError("weights must have one entry per input matrix")
+    weights = weights.clamp_min(0)
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(epsilon)
+    while weights.ndim < matrices.ndim - 2:
+        weights = weights.unsqueeze(0)
+
+    mean = (weights[..., :, None, None] * matrices).sum(dim=-3)
+    for _ in range(num_iterations):
+        inverse_sum = (
+            weights[..., :, None, None]
+            * torch.linalg.inv(mean.unsqueeze(-3) + matrices)
+        ).sum(dim=-3)
+        mean = project_spd(0.5 * torch.linalg.inv(inverse_sum), epsilon)
+    return mean
+
+
+def _skew(matrix: Tensor) -> Tensor:
+    return matrix - matrix.transpose(-1, -2)
+
+
+def _orthogonal(generator: Tensor, delta: Tensor | float = 1.0) -> Tensor:
+    """Discretized group element ``exp(delta A)`` from Eq. 10."""
+    return torch.matrix_exp(torch.as_tensor(delta, device=generator.device) * _skew(generator))
+
+
+def _translate(matrix: Tensor, group_element: Tensor) -> Tensor:
+    """The congruence action ``g X g^T`` in Eq. 9."""
+    return group_element @ matrix @ group_element.transpose(-1, -2)
+
+
+class StateSpaceDiscretization(nn.Module):
+    """Zero-order-hold discretization used in Eq. 10.
+
+    The paper prints the usual state-space discretization in compact form.
+    Solving a linear system is more stable than forming ``A^{-1}`` explicitly.
     """
-    Compute the squared distance under the LogDet metric between SPD matrices X and Y:
-    d^2(X, Y) = log(det((X+Y)/2)) - 0.5*(log(det(X)) + log(det(Y))).
-    
-    Uses torch.slogdet for numerical stability.
-    """
-    mid = (X + Y) / 2
-    _, logdet_mid = torch.slogdet(mid)
-    _, logdet_X   = torch.slogdet(X)
-    _, logdet_Y   = torch.slogdet(Y)
-    return logdet_mid - 0.5 * (logdet_X + logdet_Y)
 
+    def __init__(self, dimension: int) -> None:
+        super().__init__()
+        self.a = nn.Parameter(torch.zeros(dimension, dimension))
+        self.b = nn.Parameter(torch.eye(dimension))
+        self.log_delta = nn.Parameter(torch.tensor(0.0))
 
-def frechet_mean_logdet(X_list: list, weights, num_iterations: int = 50, lr: float = 1e-3, tol: float = 1e-6) -> Tensor:
-    """
-    Compute the weighted Fréchet mean of SPD matrices X_list under the LogDet metric.
-    
-    The Fréchet mean F* minimizes:
-      F* = argmin_F sum_{n=1}^N w_n * d^2(X_n, F),
-    where d^2 is defined by the LogDet metric.
-    
-    We parameterize F as F = L L^T + eps * I to ensure F is SPD.
-    
-    Args:
-        X_list (list of Tensors): List of SPD matrices (each of shape (N, N)).
-        weights (list or Tensor): Non-negative weights that sum to 1.
-        num_iterations (int): Maximum number of iterations.
-        lr (float): Learning rate for the optimizer.
-        tol (float): Tolerance for convergence.
-        
-    Returns:
-        Tensor: The computed weighted Fréchet mean (an SPD matrix of shape (N, N)).
-    """
-    N = X_list[0].shape[0]
-    eps = 1e-4  # Small constant to ensure SPD
-    # Initialize L as an identity matrix; F = L L^T + eps*I remains SPD.
-    L = torch.eye(N, dtype=torch.float32, requires_grad=True)
-    
-    optimizer = optim.Adam([L], lr=lr)
-    
-    # Stack input matrices for efficient computation; shape: (M, N, N)
-    X_tensor = torch.stack(X_list)
-    weights = torch.tensor(weights, dtype=torch.float32)
-    
-    prev_loss = None
-    for iteration in range(num_iterations):
-        optimizer.zero_grad()
-        F = L @ L.t() + eps * torch.eye(N, dtype=torch.float32)
-        
-        loss = 0.0
-        for i in range(X_tensor.shape[0]):
-            d2 = logdet_distance_squared(X_tensor[i], F)
-            loss = loss + weights[i] * d2
-        
-        loss.backward()
-        optimizer.step()
-        
-        if prev_loss is not None and abs(loss.item() - prev_loss) < tol:
-            break
-        prev_loss = loss.item()
-    
-    F_opt = L.detach() @ L.detach().t() + eps * torch.eye(N, dtype=torch.float32)
-    return F_opt
-
-def log_euclidean_mean(X_list, weights=None):
-    """
-    Compute the (weighted) Log-Euclidean mean of a list of SPD matrices.
-    
-    Args:
-        X_list (list of Tensors): List of SPD matrices, each of shape (N, N).
-        weights (Tensor or list): Optional, weights that sum to 1. If None, use uniform weights.
-        
-    Returns:
-        Tensor: Log-Euclidean mean SPD matrix (N x N).
-    """
-    X_tensor = torch.stack(X_list)  # Shape: (M, N, N)
-    M, N, _ = X_tensor.shape
-
-    if weights is None:
-        weights = torch.ones(M, dtype=torch.float32) / M
-    else:
-        weights = torch.tensor(weights, dtype=torch.float32)
-
-    # Matrix logarithms
-    X_log = torch.linalg.logm(X_tensor)  # Shape: (M, N, N)
-
-    # Weighted sum in the log-domain
-    X_log_mean = torch.einsum("i,ijk->jk", weights, X_log)
-
-    # Exponential map to return to SPD space
-    X_lem = torch.linalg.expm(X_log_mean)
-
-    return X_lem
-
-def FM(A: Tensor, B: Tensor, a: float, n: int) -> Tensor:
-    """
-    Compute the weighted Fréchet mean (Euclidean approximation) of two SPD matrices.
-    
-    Args:
-        A (Tensor): First SPD matrix.
-        B (Tensor): Second SPD matrix.
-        a (float): Weight coefficient.
-        n (int): (Unused in the current implementation)
-    
-    Returns:
-        Tensor: (1-a)*A + a*B.
-    """
-    return (1.0 - a) * A + a * B
-
-
-def add_small_diagonal(matrix: Tensor, epsilon: float = 1e-6) -> Tensor:
-    """
-    Add a small value to the diagonal elements of a matrix for numerical stability.
-    """
-    return matrix + torch.eye(matrix.size(0), device=matrix.device) * epsilon
-
-
-def MatrixExp(B, l, n):
-    '''
-    input a matrix B, and the total length to be calculated, n is the size of B
-    output the somehow exp(B) = I + B + B^2 / 2! + B^3 / 3! + ... + B^l / l!
-    '''
-
-    #Result = torch.eye(n, device=B.device)
-    #B = (B + B.T)/2 
-    #B = add_small_diagonal(B)
-    #matrix_to_invert = torch.subtract(Result, B)
-    Result = torch.eye(n, device=B.device).unsqueeze(0).repeat(B.shape[0], 1, 1)
-    # return torch.matmul(torch.inverse(matrix_to_invert), torch.add(Result, B))
-    return torch.matmul(torch.inverse(torch.subtract(Result, B)), torch.add(Result, B))
-    # return torch.matmul(torch.linalg.inv(Result - B), Result + B)
-
-def Translation(A: Tensor, B: Tensor, n: int, batch_size: int) -> Tensor:
-    """
-    Perform the Riemannian translation operation on SPD matrices.
-    
-    The translation is defined as: T = G X G^T,
-    where G is constructed from a parameter vector B as follows:
-      - Reshape B into a row vector.
-      - Construct a lower triangular matrix by iterating over each row,
-        extracting a slice of B and padding with zeros.
-      - Form a skew-symmetric matrix: G_skew = L - L^T.
-      - Map G_skew into a rotation matrix using the matrix exponential.
-      - Compute T = G X G^T.
-    
-    Args:
-        A (Tensor): Input SPD matrix with shape [batch_size, n, n].
-        B (Tensor): Input vector used to construct the translation matrix.
-        n (int): Dimension of the square matrix.
-        batch_size (int): Batch size.
-    
-    Returns:
-        Tensor: Translated SPD matrix.
-    """
-    power_matrix = 5
-    # Reshape B into a row vector.
-    B = torch.reshape(B, [1, -1])
-    
-    # Construct a lower triangular matrix from B.
-    lines = [torch.zeros([1, n], device=A.device)]
-    for i in range(n - 1):
-        temp_line = torch.cat(
-            [B[:, i:2 * i + 1], torch.zeros([1, n - i - 1], device=A.device)], dim=1
+    def forward(self) -> tuple[Tensor, Tensor]:
+        delta = self.log_delta.exp()
+        a_delta = delta * self.a
+        a_bar = torch.matrix_exp(a_delta)
+        identity = torch.eye(self.a.shape[0], dtype=self.a.dtype, device=self.a.device)
+        # This augmented exponential is valid even when A is singular.
+        block = torch.cat(
+            (
+                torch.cat((a_delta, delta * self.b), dim=-1),
+                torch.zeros_like(torch.cat((self.a, self.b), dim=-1)),
+            ),
+            dim=-2,
         )
-        lines.append(temp_line)
-    lower_triangle = torch.cat(lines, dim=0)
-    
-    # Form the skew-symmetric matrix.
-    B_matrix = lower_triangle - lower_triangle.T
-    # Compute the matrix exponential to obtain G in O(n).
-    B_matrix = MatrixExp(B_matrix, power_matrix, n)
-    # Expand B_matrix to match the batch dimension.
-    B_matrix = B_matrix.unsqueeze(0).repeat(batch_size, 1, 1)
-    
-    # Compute the translated SPD matrix: T = B_matrix * A * B_matrix^T.
-    Tresult = torch.matmul(B_matrix, A)
-    Tresult = torch.matmul(Tresult, B_matrix.transpose(1, 2))
-    return Tresult
+        block_exp = torch.matrix_exp(block)
+        b_bar = block_exp[: self.a.shape[0], self.a.shape[0] :]
+        return a_bar, b_bar
 
 
-def Translation_time(A, B, n, batch_size):
-    """
-    Perform a batched similarity transformation of the input matrix A using a skew-symmetric
-    matrix derived from vector B. The transformation is of the form:
+def state_space_kernel(a: Tensor, b: Tensor, c: Tensor, length: int) -> Tensor:
+    """Build ``(CB, CAB, CA^2B, ...)`` from Eq. 14."""
+    if length < 1:
+        raise ValueError("length must be positive")
+    power_b = b
+    terms = []
+    for _ in range(length):
+        terms.append(c @ power_b)
+        power_b = a @ power_b
+    return torch.stack(terms, dim=0)
 
-        T_result = B_matrix @ A @ B_matrix.T
 
-    where B_matrix ∈ O(n), i.e., a rotation matrix constructed by exponentiating a skew-symmetric
-    matrix built from B.
+class SpatiallyPreservingAttention(nn.Module):
+    """Spatially preserving attention from Eqs. 15--17."""
 
-    Args:
-        A (Tensor): A 4D tensor of shape [T, B, n, n], typically representing a batch of dynamic
-                    functional connectivity matrices over time and samples.
-        B (Tensor): A 1D vector used to construct a skew-symmetric matrix. It is reshaped and processed
-                    into a rotation matrix via matrix exponential.
-        n (int):    The spatial dimension of the square matrices in A.
-        batch_size (int): Number of samples in the batch. Used to repeat the B_matrix accordingly.
-
-    Returns:
-        Tensor: A 4D tensor of the same shape as A, where each matrix has been transformed by the
-                same O(n) rotation matrix: B_matrix @ A @ B_matrix.T
-
-    Notes:
-        - The input vector B is reshaped and used to construct a lower triangular matrix.
-        - This lower triangular matrix is made skew-symmetric, then exponentiated to obtain an O(n) matrix.
-        - The same rotation is applied across all time steps and samples in the batch.
-    """
-
-    power_matrix = 5  # Degree of Taylor approximation for matrix exponential
-    B = torch.reshape(B, [1, -1])  # Make B a row vector
-
-    # Construct a lower triangular matrix from B
-    line_B = [torch.zeros([1, n], device=A.device)]
-    for i in range(n - 1):
-        temp_line = torch.cat(
-            [B[:1, i: 2 * i + 1], torch.zeros([1, n - i - 1], device=A.device)],
-            dim=1
+    def __init__(self, time_points: int, kernel_size: int, epsilon: float = 1e-5) -> None:
+        super().__init__()
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be a positive odd integer")
+        self.root = nn.Parameter(
+            torch.empty(time_points, time_points, kernel_size, kernel_size)
         )
-        line_B.append(temp_line)
-    lower_triangle = torch.cat(line_B, dim=0)
+        nn.init.xavier_uniform_(self.root)
+        self.padding = (kernel_size - 1) // 2
+        self.epsilon = epsilon
 
-    # Make it skew-symmetric: B_matrix = L - L^T
-    B_matrix = torch.subtract(lower_triangle, lower_triangle.T)
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        # Eq. 15: K_hat = K^T K + epsilon I, followed by normalization.
+        kernel = self.root.transpose(-1, -2) @ self.root
+        eye_k = torch.eye(kernel.shape[-1], dtype=x.dtype, device=x.device)
+        kernel = kernel + self.epsilon * eye_k
+        kernel = kernel / kernel.norm(dim=(-2, -1), keepdim=True).clamp_min(self.epsilon)
 
-    # Convert skew-symmetric matrix to rotation matrix via exponential map
-    B_matrix = MatrixExp(B_matrix, power_matrix, n)  # Assumed external function
+        # Eq. 16 uses [X] = diag(rho, X): pad the SPD matrix before applying
+        # the valid convolution. The small diagonal completes the padded block.
+        padded = torch.nn.functional.pad(
+            x, (self.padding, self.padding, self.padding, self.padding)
+        )
+        padded_identity = torch.eye(padded.shape[-1], dtype=x.dtype, device=x.device)
+        padded = padded + self.epsilon * padded_identity
+        response = torch.nn.functional.conv2d(padded, kernel)
+        response = project_spd(response, self.epsilon)
+        response = response / response.norm(
+            dim=(-2, -1), keepdim=True
+        ).clamp_min(self.epsilon)
+        # Here exp is the matrix exponential from the Riemannian algebra; see
+        # Appendix A.4. Dividing by the largest entry gives Eq. 16's soft mask.
+        attention = torch.matrix_exp(response)
+        attention = attention / attention.amax(
+            dim=(-2, -1), keepdim=True
+        ).clamp_min(self.epsilon)
 
-    # Reshape and repeat B_matrix across batch
-    B_matrix = B_matrix.unsqueeze(0).unsqueeze(0)  # Shape: [1, 1, n, n]
-    B_matrix = B_matrix.repeat(batch_size, 1, 1, 1)  # Shape: [B, 1, n, n]
-
-    # Apply similarity transformation: B A B^T
-    A = torch.einsum('tbmn,b1mn->tbmn', A, B_matrix)
-    Tresult = torch.einsum('tbmn,b1nm->tbmn', A, B_matrix.permute(0, 1, 3, 2))
-
-    return Tresult
+        # Eq. 17 applies the mask to X*K, not to the unfiltered input X.
+        attended = attention * response
+        identity = torch.eye(attended.shape[-1], dtype=x.dtype, device=x.device)
+        return project_spd(attended, self.epsilon) + self.epsilon * identity, attention
 
 
-class GeoMind(nn.Module):
+class GeometricStateLayer(nn.Module):
+    """One history-aware geometric state layer from Eqs. 7--10."""
 
-# Will release after acceptance.
+    def __init__(self, dimension: int, tau: int, stein_iterations: int, epsilon: float) -> None:
+        super().__init__()
+        if tau < 1:
+            raise ValueError("tau must be positive")
+        self.dimension = dimension
+        self.tau = tau
+        self.stein_iterations = stein_iterations
+        self.epsilon = epsilon
+
+        # One transformation is learned for every lag in the history window.
+        # The skew exponential gives the O(N) action required by Eq. 9, while
+        # also providing A_tilde = exp(delta A) from Eq. 10.
+        self.a = nn.Parameter(torch.zeros(tau, dimension, dimension))
+        self.b = nn.Parameter(torch.zeros(tau + 1, dimension, dimension))
+        self.c = nn.Parameter(torch.zeros(tau + 1, dimension, dimension))
+        self.d = nn.Parameter(torch.zeros(tau + 1, dimension, dimension))
+        self.log_delta = nn.Parameter(torch.tensor(0.0))
+        self.state_logits = nn.Parameter(torch.zeros(2 * tau + 1))
+        self.output_logits = nn.Parameter(torch.zeros(2 * (tau + 1)))
+
+    def _weighted_mean(self, values: list[Tensor], logits: Tensor) -> Tensor:
+        return frechet_mean_logdet(
+            values,
+            logits.softmax(dim=0),
+            num_iterations=self.stein_iterations,
+            epsilon=self.epsilon,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        length = x.shape[1]
+        states: list[Tensor] = []
+        outputs: list[Tensor] = []
+        delta = self.log_delta.exp()
+        # A, B, C and D are constant across a sequence. Discretize them once
+        # here instead of rebuilding the same matrix exponential at every step.
+        a_group = _orthogonal(self.a, delta)
+        b_group = _orthogonal(self.b, delta)
+        c_group = _orthogonal(self.c, delta)
+        d_group = _orthogonal(self.d, delta)
+
+        for step in range(length):
+            start = max(0, step - self.tau)
+            state_window = states[start:step]
+            input_window = [x[:, j] for j in range(start, step + 1)]
+
+            state_terms = [
+                _translate(value, a_group[-len(state_window) + i])
+                for i, value in enumerate(state_window)
+            ]
+            input_terms = [
+                _translate(value, b_group[-len(input_window) + i])
+                for i, value in enumerate(input_window)
+            ]
+            state_weights = torch.cat(
+                (
+                    self.state_logits[self.tau - len(state_window) : self.tau],
+                    self.state_logits[-len(input_window) :],
+                )
+            )
+            state = self._weighted_mean(state_terms + input_terms, state_weights)
+            states.append(state)
+
+            output_states = states[max(0, len(states) - self.tau - 1) :]
+            output_inputs = input_window
+            observed = [
+                _translate(value, c_group[-len(output_states) + i])
+                for i, value in enumerate(output_states)
+            ]
+            skipped = [
+                _translate(value, d_group[-len(output_inputs) + i])
+                for i, value in enumerate(output_inputs)
+            ]
+            output_weights = torch.cat(
+                (
+                    self.output_logits[
+                        self.tau + 1 - len(output_states) : self.tau + 1
+                    ],
+                    self.output_logits[-len(output_inputs) :],
+                )
+            )
+            outputs.append(self._weighted_mean(observed + skipped, output_weights))
+
+        return torch.stack(outputs, dim=1)
+
+
+class GeoDynamics(nn.Module):
+    """Two-layer GeoDynamics network using the paper's full readout."""
+
+    def __init__(
+        self,
+        dimension: int,
+        time_points: int,
+        num_classes: int,
+        kernel_size: int = 5,
+        tau: int = 3,
+        num_layers: int = 2,
+        stein_iterations: int = 3,
+        readout: str = "final",
+        feature_normalization: str = "none",
+        vectorization: str = "full",
+        epsilon: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        if num_layers != 2:
+            raise ValueError("Table 6 specifies two GeoDynamics layers")
+        self.dimension = dimension
+        self.time_points = time_points
+        if readout not in {"final", "mean", "frechet"}:
+            raise ValueError("readout must be 'final', 'mean', or 'frechet'")
+        self.readout = readout
+        if feature_normalization not in {"none", "batch"}:
+            raise ValueError("feature_normalization must be 'none' or 'batch'")
+        if vectorization not in {"full", "upper"}:
+            raise ValueError("vectorization must be 'full' or 'upper'")
+        self.vectorization = vectorization
+        self.spa = SpatiallyPreservingAttention(time_points, kernel_size, epsilon)
+        self.layers = nn.ModuleList(
+            GeometricStateLayer(dimension, tau, stein_iterations, epsilon)
+            for _ in range(num_layers)
+        )
+        # Eqs. 11--13 use the complete vec(log(Y^K)) and one linear softmax
+        # classifier. CrossEntropyLoss applies softmax during training.
+        feature_size = (
+            dimension * dimension
+            if vectorization == "full"
+            else dimension * (dimension + 1) // 2
+        )
+        upper = torch.triu_indices(dimension, dimension)
+        self.register_buffer("upper_rows", upper[0], persistent=False)
+        self.register_buffer("upper_columns", upper[1], persistent=False)
+        self.feature_normalization = (
+            nn.BatchNorm1d(feature_size, affine=False)
+            if feature_normalization == "batch"
+            else nn.Identity()
+        )
+        self.classifier = nn.Linear(feature_size, num_classes)
+        self.temporal_readout_logits = (
+            nn.Parameter(torch.zeros(time_points)) if readout == "frechet" else None
+        )
+        self.epsilon = epsilon
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        if x.ndim != 4 or x.shape[1:] != (
+            self.time_points,
+            self.dimension,
+            self.dimension,
+        ):
+            raise ValueError(
+                f"expected (B,{self.time_points},{self.dimension},{self.dimension}), "
+                f"got {tuple(x.shape)}"
+            )
+        x, attention = self.spa(project_spd(x, self.epsilon))
+        for layer in self.layers:
+            x = layer(x)
+        if self.readout == "frechet":
+            final_output = frechet_mean_logdet(
+                x,
+                self.temporal_readout_logits.softmax(dim=0),
+                num_iterations=self.layers[0].stein_iterations,
+                epsilon=self.epsilon,
+            )
+        elif self.readout == "mean":
+            # The released experiment driver pools over the complete output
+            # sequence. A convex mean of SPD matrices remains SPD.
+            final_output = x.mean(dim=1)
+        else:
+            final_output = x[:, -1]
+        final_tangent = matrix_log_spd(final_output, self.epsilon)
+        if self.vectorization == "upper":
+            features = final_tangent[:, self.upper_rows, self.upper_columns]
+        else:
+            features = final_tangent.reshape(x.shape[0], -1)
+        features = self.feature_normalization(features)
+        logits = self.classifier(features)
+        return logits, attention
