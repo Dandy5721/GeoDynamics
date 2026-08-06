@@ -1,0 +1,8 @@
+@inproceedings{
+dan2025geodynamics,
+title={GeoDynamics: A Geometric State\nobreakdash-Space Neural Network for Understanding Brain Dynamics on Riemannian Manifolds},
+author={Tingting Dan and Jiaqi Ding and Guorong Wu},
+booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
+year={2025},
+url={https://openreview.net/forum?id=7WPi6VbtH0}
+}
